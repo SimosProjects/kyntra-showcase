@@ -2,7 +2,7 @@
 
 An offline-first gym workout log for iOS and Android. In English and Spanish, in beta.
 
-**Try it:** TestFlight: `[TODO: add the public TestFlight link]` · Google Play: `[TODO: add the Google Play testing link]` ·
+**Try it:** TestFlight: `https://testflight.apple.com/join/jMyqfTwA` · Google Play: in closed beta on Google Play. Access available on request. ·
 Website: [kyntra.fit](https://kyntra.fit)
 
 <p>
