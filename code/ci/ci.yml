@@ -1,0 +1,107 @@
+# Excerpt from the private Kyntra repository.
+name: ci
+
+# The one workflow that runs on pull requests and on main. `changes` decides from the changed files which checks are
+# needed (infra/ci/changes.py holds the path filters), each check workflow runs as a called workflow or shows as
+# skipped, and `ci passed` reports the result. `ci passed` is the only required status check on main: it fails only
+# when a check failed or was cancelled, and a check skipped on purpose (a draft, or no matching files) counts as
+# passed. So a docs-only pull request never leaves a required check pending.
+#
+# A draft pull request gets the light checks only (each called workflow decides which jobs). Marking it ready starts a
+# new run on the same commit, so the merge waits for the full suite.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request or branch cancels its older run. Runs on main are never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mobile: ${{ steps.decide.outputs.mobile }}
+      api: ${{ steps.decide.outputs.api }}
+      infra: ${{ steps.decide.outputs.infra }}
+      site: ${{ steps.decide.outputs.site }}
+      security: ${{ steps.decide.outputs.security }}
+    steps:
+      # A pull request checks out its merge commit, whose first parent is the base branch: two commits are enough. A
+      # push to main needs the commit before it, so it fetches the history.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'push' && '0' || '2' }}
+          persist-credentials: false
+      - run: python3 -m unittest discover -s infra/ci -p "test_*.py"
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          files="$RUNNER_TEMP/changed.txt"
+          : > "$files"
+          if [[ "$EVENT" == pull_request ]]; then
+            git diff --name-only HEAD^1 HEAD > "$files"
+          elif [[ "$EVENT" == push ]]; then
+            # A push whose previous commit cannot be read (a new branch, a force push) runs every check.
+            if [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              EVENT=workflow_dispatch
+            else
+              git diff --name-only "$BEFORE" HEAD > "$files"
+            fi
+          fi
+          echo "Changed files: $(wc -l < "$files")"
+          python3 infra/ci/changes.py "$EVENT" < "$files" | tee -a "$GITHUB_OUTPUT"
+
+  mobile:
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    uses: ./.github/workflows/mobile.yml
+
+  api:
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
+    uses: ./.github/workflows/api.yml
+
+  infra:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    uses: ./.github/workflows/infra.yml
+
+  site:
+    needs: changes
+    if: needs.changes.outputs.site == 'true'
+    uses: ./.github/workflows/site.yml
+
+  security:
+    needs: changes
+    if: needs.changes.outputs.security == 'true'
+    uses: ./.github/workflows/security.yml
+
+  ci-passed:
+    name: ci passed
+    needs: [changes, mobile, api, infra, site, security]
+    # Runs whatever the others did, so it always reports.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s' "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad="$(printf '%s' "$NEEDS" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')"
+          if [[ -n "$bad" ]]; then
+            echo "::error::Failed or cancelled: $bad"
+            exit 1
+          fi
+          echo "Every check passed or was skipped on purpose."

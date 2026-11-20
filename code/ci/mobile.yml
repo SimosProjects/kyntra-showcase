@@ -1,0 +1,55 @@
+# Excerpt from the private Kyntra repository.
+name: mobile
+
+# A draft pull request gets the light checks only: lint, Prettier, the type check and the EAS config check. The full
+# suite (migrations, both Jest projects, the Expo config) runs once the pull request is ready for review, on every push
+# after that, and on main. Marking a pull request ready starts a new run on the same commit, so the merge waits for the full suite.
+# Its path filter (infra/ci/changes.py) includes the files outside apps/mobile that the app's tests read.
+on:
+  # Called by ci.yml, which decides from the changed files whether this check is needed.
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # Everything except a draft pull request runs the full suite.
+  FULL: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format
+      - run: npm run typecheck
+      # On every pull request, drafts included: the production config loads with the plugins applied, on Android and
+      # iOS, on the Node that eas.json pins for EAS (scripts/check-eas-config.js).
+      - run: npm run config:check
+      - name: Check migrations are committed
+        if: env.FULL == 'true'
+        run: |
+          npm run db:generate
+          test -z "$(git status --porcelain -- drizzle)" || { git status --porcelain -- drizzle; echo "Schema changed without a committed migration."; exit 1; }
+          npm run db:check
+      - if: env.FULL == 'true'
+        run: npm run test:app -- --ci
+      # The tests that time a render against its budget, one file at a time.
+      - if: env.FULL == 'true'
+        run: npm run test:perf -- --ci
+      - name: Validate Expo config
+        if: env.FULL == 'true'
+        run: npx expo config --type public > /dev/null

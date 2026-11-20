@@ -1,0 +1,96 @@
+# Excerpt from the private Kyntra repository.
+name: api
+
+# A draft pull request gets the light checks only: format and the Release build. The full suite (the tests, the
+# generated types and the NuGet advisories) runs once the pull request is ready for review, on every push after that,
+# on main, and weekly. Marking a pull request ready starts a new run on the same commit, so the merge waits for it.
+on:
+  # Called by ci.yml, which decides from the changed files whether this check is needed.
+  workflow_call:
+  # Weekly on main, so a newly published advisory for a package we already use is caught.
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Everything except a draft pull request runs the full suite.
+  FULL: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+
+jobs:
+  check:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: api
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The NuGet packages are cached, keyed on the central package versions and the project files.
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: api/global.json
+          cache: true
+          cache-dependency-path: |
+            api/Directory.Packages.props
+            api/**/*.csproj
+      - run: dotnet restore Kyntra.slnx
+      - run: dotnet format Kyntra.slnx --verify-no-changes --no-restore
+      - run: dotnet build Kyntra.slnx --no-restore --configuration Release
+      - if: env.FULL == 'true'
+        run: dotnet test Kyntra.slnx --no-build --configuration Release
+
+  # The app's API types are generated from the OpenAPI document that the dotnet tests keep in
+  # step with the API. This fails if the generated file was not regenerated and committed.
+  types:
+    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: api/openapi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: api/openapi/package-lock.json
+      - run: npm ci
+      - run: npm run types:check
+
+  # Vulnerable NuGet packages, direct and transitive. OSV-Scanner does not read central package
+  # management, so this is the check for the API's packages. Fails on high or critical.
+  packages:
+    name: packages (nuget)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: api/global.json
+          cache: true
+          cache-dependency-path: |
+            api/Directory.Packages.props
+            api/**/*.csproj
+      - run: dotnet restore api/Kyntra.slnx
+      - run: |
+          dotnet list api/Kyntra.slnx package --vulnerable --include-transitive --format json > "$RUNNER_TEMP/nuget.json"
+          python3 infra/security/nuget-gate.py "$RUNNER_TEMP/nuget.json"
